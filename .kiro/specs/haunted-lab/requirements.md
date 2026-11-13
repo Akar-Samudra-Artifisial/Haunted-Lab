@@ -77,6 +77,7 @@ This spec covers the lab only. The Exorcist agent, the MCP tools that read the o
 4. THE `route` label SHALL be the route template (for example `/checkout`) or `unmatched`, and SHALL NOT contain a raw request path.
 5. THE Service SHALL NOT export an `up` metric; `up` comes from the Prometheus scrape.
 6. THE Service SHALL NOT count `/metrics`, `/healthz` and `/debug/*` requests in `http_requests_total`.
+7. WHEN a Service starts, THE Service SHALL expose `http_requests_total` at 0 with codes `200` and `500` for each of its own routes, so that the error ratio of a healthy Service is 0 rather than empty.
 
 ### Requirement 4: Error and log rings
 
@@ -121,6 +122,10 @@ This spec covers the lab only. The Exorcist agent, the MCP tools that read the o
 9. WHEN the Supervisor boots, THE Supervisor SHALL deploy `main` for every Service with actor `supervisor`.
 10. WHEN the Supervisor receives SIGTERM or SIGINT, THE Supervisor SHALL stop all children and exit with code 0.
 11. THE Supervisor SHALL bind `127.0.0.1` and SHALL capture the stdout and stderr of each child into a per-service buffer of the last 500 lines that survives restarts.
+12. THE Supervisor SHALL start each child in its own process group, SHALL signal the whole group when stopping it, and SHALL record the live child pid of each Service in `data/pids.json`.
+13. WHEN the Supervisor starts, THE Supervisor SHALL stop every pid recorded in `data/pids.json` whose command line is still that lab Service, before deploying, and SHALL leave any other process alone.
+14. WHEN the Supervisor starts, and after each Deploy, THE Supervisor SHALL remove every Worktree except the active one per Service, using `git worktree remove --force` and `git worktree prune`.
+15. THE Supervisor SHALL run every git command without user or system git config (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`) and with a timeout.
 
 ### Requirement 7: Chaos controller
 
@@ -129,7 +134,7 @@ This spec covers the lab only. The Exorcist agent, the MCP tools that read the o
 #### Acceptance Criteria
 
 1. THE Chaos_Controller SHALL accept a request only when it carries the Bearer_Token equal to `CHAOS_TOKEN`, compared in constant time, and SHALL otherwise answer 401.
-2. IF `CHAOS_TOKEN` is unset or shorter than 16 characters at start, THEN THE Supervisor SHALL print the NAME, SHALL NOT print the value, and SHALL exit with code 1.
+2. IF `CHAOS_TOKEN` or `LAB_READ_TOKEN` is unset, shorter than 16 characters or starts with the placeholder prefix `change-me`, or IF the two tokens are equal, THEN THE Supervisor SHALL print the NAME(s), SHALL NOT print any value, and SHALL exit with code 1 before deploying anything.
 3. WHEN `POST /chaos/scenarios/{name}/apply` is called with a known Scenario name, THE Chaos_Controller SHALL deploy the Scenario_Branch for the target Service and SHALL leave every other Service on `main`.
 4. IF the Scenario name is unknown, THEN THE Chaos_Controller SHALL answer 404 with the code `unknown_scenario`.
 5. WHEN `POST /chaos/reset` is called, THE Chaos_Controller SHALL deploy `main` for every Service and SHALL clear the active Scenario.
@@ -157,6 +162,10 @@ This spec covers the lab only. The Exorcist agent, the MCP tools that read the o
 9. THE `limit` parameter SHALL default to 100, SHALL be at most 500, and an invalid `limit`, `since` or `service` SHALL answer 400 with the code `bad_request`.
 10. THE Observability_API SHALL NOT include env values in any response and SHALL answer 405 for every method other than GET.
 11. THE responses SHALL be JSON with `content-type: application/json` and the text fields SHALL be treated as untrusted data by consumers.
+12. EVERY `/lab/*` response, errors included, SHALL carry a top-level `"untrusted": true`, and the fields `message`, `line`, `frame`, `diff`, `subject`, `author` and `ref` SHALL have ANSI escapes and control characters removed (a diff keeps line feeds and tabs) and SHALL be capped per field.
+13. THE Observability_API SHALL strip every local absolute path from frames, messages and log lines: repo files become repo-relative, dependency files become `node_modules/...`, any other path keeps only its file name.
+14. THE diff route SHALL limit a commit diff to the paths `services` and `packages`.
+15. THE Observability_API SHALL serve `/lab/deploys` from a bounded in-memory tail of the Deploy_Log loaded once at start and appended on each Deploy, and SHALL NOT re-read the file per request.
 
 ### Requirement 9: Scenarios and planted commits
 
@@ -165,13 +174,14 @@ This spec covers the lab only. The Exorcist agent, the MCP tools that read the o
 #### Acceptance Criteria
 
 1. WHEN the Plant_Script runs, THE Plant_Script SHALL create the branches `scenario/error-spike`, `scenario/fog` and `scenario/dark-room`, each exactly one commit on top of `main`.
-2. THE Plant_Script SHALL create each Culprit_Commit with a fixed author, committer, author date, committer date and message, so that the SHAs are identical on every machine.
+2. THE Plant_Script SHALL create each Culprit_Commit with a fixed author, committer and message, and with author and committer dates equal to the base commit's committer date plus 1 h (`error-spike`), 2 h (`fog`) and 3 h (`dark-room`), so that the SHAs are identical on every machine for a given base and every planted commit is newer than its parent.
 3. WHEN the Plant_Script runs again, THE Plant_Script SHALL leave the three branches and their SHAs unchanged.
 4. THE Culprit_Commit of `error-spike` SHALL be titled "simplify refund lookup", SHALL change only `payments`, and SHALL remove a null guard, so that about 30 percent of charge requests throw.
 5. THE Culprit_Commit of `fog` SHALL be titled "add inventory freshness check", SHALL change only `orders`, and SHALL add a slow sequential dependency call, so that p95 rises from about 40 ms to over 1.5 s with no increase in errors.
 6. THE Culprit_Commit of `dark-room` SHALL be titled "tidy config loading", SHALL change only `ledger`, and SHALL read a renamed env var, so that the process exits at start, the Supervisor crash-loops it and `up` is 0.
 7. A test SHALL assert the three SHAs and SHALL fail when any of them changes.
 8. WHILE `main` runs under the Traffic_Generator, THE Lab SHALL show an error ratio below 0.01 and a p95 below 0.25 s on every Service.
+9. WHEN `scripts/scenario-shas.json` exists, a test SHALL assert that each scenario branch is exactly one commit whose parent is the recorded base, that the recorded base is an ancestor of `main`, and that the branch SHAs equal the record (it SHALL NOT require `main` to equal the base, because committing the record moves `main`).
 
 ### Requirement 10: Prometheus and compose
 
@@ -183,6 +193,7 @@ This spec covers the lab only. The Exorcist agent, the MCP tools that read the o
 2. THE `deploy/compose.yaml` SHALL run Prometheus and SHALL work with `docker compose` on the development Mac and with `podman compose` on EC2.
 3. THE compose file SHALL publish Prometheus only on `127.0.0.1`.
 4. THE compose file SHALL read scrape target addresses from files in `deploy/`, with no secret in them.
+5. ON Linux, `deploy/compose.linux.yaml` SHALL run Prometheus on the host network, listening on `127.0.0.1` only, so that the Services stay bound to `127.0.0.1` and never need `0.0.0.0`.
 
 ### Requirement 11: Gate G1 check
 

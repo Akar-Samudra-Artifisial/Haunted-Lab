@@ -1,0 +1,13 @@
+{
+  "name": "@haunted-lab/ledger",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": { "@haunted-lab/common": "workspace:*" }
+}

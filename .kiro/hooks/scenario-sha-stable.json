@@ -8,7 +8,7 @@
       "matcher": "services/.*",
       "action": {
         "type": "agent",
-        "prompt": "A file under services/ was saved. The scenario branches are built on top of main by scripts/plant-scenarios.mjs, so any change to main changes what the planted commits patch. Re-run the plant script test (pnpm --filter ./scripts test, or the test that asserts the three scenario SHAs) and, if the SHAs moved, update the expected values together with the plant script, and say so in the task notes."
+        "prompt": "A file under services/ was saved. The scenario branches are built on top of main by scripts/plant-scenarios.mjs, so any change to main changes what the planted commits patch. Re-run the plant script test (pnpm --filter @haunted-lab/supervisor exec vitest run test/plant.test.ts). If a runtime file changed on purpose and the SHAs moved, update EXPECTED in supervisor/test/plant.test.ts (and the scenario patches in scripts/lab-git.mjs if the patched code changed), and say so in the task notes."
       }
     }
   ]

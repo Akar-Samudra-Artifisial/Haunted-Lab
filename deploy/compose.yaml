@@ -1,0 +1,27 @@
+# Prometheus for the Haunted Lab.
+#   Mac (colima):  docker compose -f deploy/compose.yaml up -d     (or docker-compose -f ...)
+#   Linux / EC2:   podman compose -f deploy/compose.yaml -f deploy/compose.linux.yaml up -d
+# The services stay bound to the host's 127.0.0.1 in both cases.
+# Mac: Prometheus is published on 127.0.0.1 only and reaches the services as `lab-host`, mapped to
+# the host gateway (on colima that address forwards to the Mac's loopback).
+# Linux: on a Linux host the gateway is a bridge address, which would need the services on 0.0.0.0,
+# so compose.linux.yaml switches Prometheus to the host network instead (listening on 127.0.0.1).
+# No secrets in this file or in deploy/targets/.
+name: haunted-lab
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2h
+      - --web.listen-address=:9090
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    extra_hosts:
+      - "lab-host:${LAB_HOST_ADDR:-host-gateway}"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./targets:/etc/prometheus/targets:ro
+    restart: unless-stopped

@@ -1,0 +1,15 @@
+# Linux (EC2) override for deploy/compose.yaml:
+#   podman compose -f deploy/compose.yaml -f deploy/compose.linux.yaml up -d
+# Prometheus shares the host network, so it scrapes the services on the host's 127.0.0.1 and the
+# services never need to listen on 0.0.0.0. Prometheus itself listens on 127.0.0.1 only.
+services:
+  prometheus:
+    network_mode: host
+    ports: !reset []
+    extra_hosts: !override
+      - "lab-host:127.0.0.1"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2h
+      - --web.listen-address=127.0.0.1:${PROMETHEUS_PORT:-9090}

@@ -7,3 +7,7 @@ worktrees/
 spike/
 *.log
 .vscode/
+.DS_Store
+*.pem
+coverage/
+services/*/.scenario-*/

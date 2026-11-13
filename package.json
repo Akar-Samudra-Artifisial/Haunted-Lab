@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "pnpm -r --if-present typecheck",
-    "lint": "pnpm -r --if-present lint",
+    "lint": "pnpm -r --if-present lint && eslint scripts",
     "test": "pnpm -r --if-present test",
     "build": "pnpm -r --if-present build"
   },

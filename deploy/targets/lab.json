@@ -1,0 +1,6 @@
+[
+  { "targets": ["lab-host:4001"], "labels": { "service": "gate" } },
+  { "targets": ["lab-host:4002"], "labels": { "service": "orders" } },
+  { "targets": ["lab-host:4003"], "labels": { "service": "payments" } },
+  { "targets": ["lab-host:4004"], "labels": { "service": "ledger" } }
+]

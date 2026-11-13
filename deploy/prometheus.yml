@@ -1,0 +1,14 @@
+# Prometheus for the Haunted Lab. Scrapes the four services every 5 s.
+# Targets come from deploy/targets/*.json (file service discovery), each with a `service` label.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: lab
+    metrics_path: /metrics
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/*.json
+        refresh_interval: 5s
