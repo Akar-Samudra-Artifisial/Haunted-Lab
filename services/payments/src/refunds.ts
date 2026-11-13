@@ -27,9 +27,6 @@ export function findRefund(orderId: string): RefundTerms | undefined {
 }
 
 export function refundTerms(orderId: string): RefundTerms {
-  const refund = findRefund(orderId);
-  if (!refund) {
-    return DEFAULT_TERMS;
-  }
+  const refund = findRefund(orderId) as RefundTerms;
   return { windowDays: refund.windowDays, feeCents: refund.feeCents };
 }
