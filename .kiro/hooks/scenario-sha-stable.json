@@ -1,0 +1,15 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Keep scenario SHAs stable",
+      "trigger": "PostFileSave",
+      "description": "Remind to keep planted scenario commit SHAs stable after a service file changes",
+      "matcher": "services/.*",
+      "action": {
+        "type": "agent",
+        "prompt": "A file under services/ was saved. The scenario branches are built on top of main by scripts/plant-scenarios.mjs, so any change to main changes what the planted commits patch. Re-run the plant script test (pnpm --filter ./scripts test, or the test that asserts the three scenario SHAs) and, if the SHAs moved, update the expected values together with the plant script, and say so in the task notes."
+      }
+    }
+  ]
+}
