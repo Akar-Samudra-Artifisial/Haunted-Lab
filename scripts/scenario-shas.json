@@ -1,0 +1,8 @@
+{
+  "base": "5cd6063f831ea45d06bfda415471e9bf4dc1322d",
+  "shas": {
+    "error-spike": "65c0fca31d0df62c4bab40d2d854c81b1044c650",
+    "fog": "739d1217dc01c07adc69d38d53231d0dfab23b1f",
+    "dark-room": "0b8dff146e2ddb3f9a7e5761ea63cfab9eb5e7aa"
+  }
+}
