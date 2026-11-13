@@ -8,10 +8,10 @@ export interface LedgerConfig {
 export function loadConfig(env: Record<string, string | undefined> = process.env): LedgerConfig {
   const cfg = parseEnv(
     {
-      LEDGER_PORT: { kind: 'port' },
+      LEDGER_LISTEN_PORT: { kind: 'port' },
       SERVICE_BIND_HOST: { kind: 'host', default: '127.0.0.1' },
     },
     env,
   );
-  return { port: Number(cfg.LEDGER_PORT), host: cfg.SERVICE_BIND_HOST };
+  return { port: Number(cfg.LEDGER_LISTEN_PORT), host: cfg.SERVICE_BIND_HOST };
 }
