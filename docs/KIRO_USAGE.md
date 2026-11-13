@@ -13,3 +13,4 @@ One line per finished task: date | spec/task | what Kiro did.
 - 2026-11-13 | haunted-lab/10 | Kiro wrote g1-check.mjs and ran it on this Mac: all three scenarios detected and recovered within 30 s.
 - 2026-11-13 | haunted-lab/11 | Kiro wrote DEV.md and .env.example, scanned for secrets and home paths, and ran the full install, typecheck, lint, test and build chain.
 - 2026-11-13 | haunted-lab/12 | Kiro applied the code and security review fixes (plant record check and dates, token rules, process groups and stale pids, worktree cleanup, git isolation, untrusted /lab data, zeroed counters, Linux host-network compose) with tests, and re-ran G1.
+- 2026-11-14 | fix-deploy/spec | Kiro wrote the fix-deploy spec (deploy-fix route per the Haunted Ops contract, bare mirror, allow-list, fix isolation, review leftovers) and updated the chaos, security and structure steering.
