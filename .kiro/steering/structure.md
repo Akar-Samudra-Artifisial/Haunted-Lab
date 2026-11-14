@@ -12,7 +12,7 @@ scripts/
   plant-scenarios.mjs                creates scenario/* branches with stable SHAs
   scenario-shas.json                 pinned { base, shas } of the scenario branches
   g1-check.mjs                       Gate G1 end to end check
-  fix-deploy-check.mjs               deploys a real merged fix (planned, spec fix-deploy)
+  fix-deploy-check.mjs               deploys a real merged fix and checks it ends its scenario
 deploy/
   prometheus.yml  compose.yaml  compose.linux.yaml  targets/
 docs/

@@ -8,10 +8,25 @@ export const GIT_ENV: Readonly<NodeJS.ProcessEnv> = Object.freeze({
   PATH: process.env.PATH,
   GIT_CONFIG_GLOBAL: '/dev/null',
   GIT_CONFIG_NOSYSTEM: '1',
+  // `refs/replace/*` (e.g. from a fetched ref) must never swap the objects we check and deploy.
+  GIT_NO_REPLACE_OBJECTS: '1',
   GIT_TERMINAL_PROMPT: '0',
   GIT_PAGER: 'cat',
   LC_ALL: 'C',
 });
+
+/**
+ * Options on every git call: verify fetched objects, and never run hooks (a repo-level
+ * `core.hooksPath` or `.git/hooks` must not execute anything for the supervisor).
+ */
+export const GIT_HARDENING: readonly string[] = Object.freeze([
+  '-c',
+  'fetch.fsckObjects=true',
+  '-c',
+  'transfer.fsckObjects=true',
+  '-c',
+  'core.hooksPath=/dev/null',
+]);
 
 /** Every git call is killed after this long. */
 export const GIT_TIMEOUT_MS = 30_000;
@@ -31,30 +46,56 @@ export interface GitResult {
   stdout: string;
 }
 
+/** git output went over the caller's `maxBuffer`. */
+export class GitOutputTooLarge extends GitError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GitOutputTooLarge';
+  }
+}
+
+export interface GitOptions {
+  maxBuffer?: number;
+  timeoutMs?: number;
+  /** Extra env on top of `GIT_ENV` (e.g. `GIT_ALLOW_PROTOCOL`). */
+  env?: Readonly<Record<string, string>>;
+}
+
 /** Run git with an argument array (never a shell string) and a timeout. Resolves for any exit code. */
-export function git(repo: string, args: readonly string[], opts: { maxBuffer?: number; timeoutMs?: number } = {}): Promise<GitResult> {
+export function git(repo: string, args: readonly string[], opts: GitOptions = {}): Promise<GitResult> {
   return new Promise((resolve, reject) => {
     execFile(
       'git',
-      ['-C', repo, ...args],
-      { env: GIT_ENV, maxBuffer: opts.maxBuffer ?? 4 * 1024 * 1024, timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS, killSignal: 'SIGKILL', windowsHide: true },
+      [...GIT_HARDENING, '-C', repo, ...args],
+      {
+        env: opts.env ? { ...GIT_ENV, ...opts.env } : GIT_ENV,
+        maxBuffer: opts.maxBuffer ?? 4 * 1024 * 1024,
+        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
+        windowsHide: true,
+      },
       (err, stdout) => {
+        const code = (err as { code?: unknown } | null)?.code;
+        if (code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+          reject(new GitOutputTooLarge(`git ${args[0] ?? ''} output too large`));
+          return;
+        }
         if (err && (err as { killed?: boolean }).killed) {
           reject(new GitError(`git ${args[0] ?? ''} timed out`));
           return;
         }
-        if (err && typeof (err as { code?: unknown }).code !== 'number') {
+        if (err && typeof code !== 'number') {
           reject(new GitError(`git ${args[0] ?? ''} failed to run`));
           return;
         }
-        resolve({ code: err ? Number((err as { code: number }).code) : 0, stdout: String(stdout) });
+        resolve({ code: err ? Number(code) : 0, stdout: String(stdout) });
       },
     );
   });
 }
 
-async function gitOk(repo: string, args: readonly string[]): Promise<string> {
-  const r = await git(repo, args);
+export async function gitOk(repo: string, args: readonly string[], opts: GitOptions = {}): Promise<string> {
+  const r = await git(repo, args, opts);
   if (r.code !== 0) throw new GitError(`git ${args[0] ?? ''} exited with ${r.code}`);
   return r.stdout.trim();
 }
@@ -117,7 +158,7 @@ export async function commitInfo(repo: string, sha: string): Promise<CommitInfo>
  */
 export function commitDiff(repo: string, sha: string, cap: number, timeoutMs: number = GIT_TIMEOUT_MS): Promise<{ diff: Buffer; truncated: boolean }> {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['-C', repo, 'show', '--no-color', '--no-ext-diff', '--format=', '--patch', sha, '--', ...DIFF_PATHSPEC], {
+    const child = spawn('git', [...GIT_HARDENING, '-C', repo, 'show', '--no-color', '--no-ext-diff', '--format=', '--patch', sha, '--', ...DIFF_PATHSPEC], {
       env: GIT_ENV,
       stdio: ['ignore', 'pipe', 'ignore'],
       windowsHide: true,

@@ -14,3 +14,14 @@ One line per finished task: date | spec/task | what Kiro did.
 - 2026-11-13 | haunted-lab/11 | Kiro wrote DEV.md and .env.example, scanned for secrets and home paths, and ran the full install, typecheck, lint, test and build chain.
 - 2026-11-13 | haunted-lab/12 | Kiro applied the code and security review fixes (plant record check and dates, token rules, process groups and stale pids, worktree cleanup, git isolation, untrusted /lab data, zeroed counters, Linux host-network compose) with tests, and re-ran G1.
 - 2026-11-14 | fix-deploy/spec | Kiro wrote the fix-deploy spec (deploy-fix route per the Haunted Ops contract, bare mirror, allow-list, fix isolation, review leftovers) and updated the chaos, security and structure steering.
+- 2026-11-14 | fix-deploy/1 | Kiro added the deploy-fix contract types, the total body validator and the pure deployFixAllowed rule, with property tests 1 and 2.
+- 2026-11-14 | fix-deploy/2 | Kiro changed the allow-list to named / fix / denied so apply, reset and boot can never run an incident ref, with property test 3.
+- 2026-11-14 | fix-deploy/3 | Kiro added the bare mirror data/repo.git, the one-ref incident fetch, the origin URL validator, pinned allowed heads and the chain reader, with property tests 4 and 9.
+- 2026-11-14 | fix-deploy/4 | Kiro isolated fix children (whitelist env, node --permission, optional FIX_RUN_AS_USER), found a fourth read path was needed, and tested that a child cannot see the tokens, with property tests 5 and 6.
+- 2026-11-14 | fix-deploy/5 | Kiro registered worktrees to the mirror, removed ones left in the checkout, and added the 1 h fix worktree cleanup, with property test 7.
+- 2026-11-14 | fix-deploy/6 | Kiro wired POST /chaos/deploy-fix under the Lab mutex with only the contract statuses, extended diffs to incident refs, and covered every case against a local origin fixture, with property test 8.
+- 2026-11-14 | fix-deploy/7 | Kiro made G1 use the real scenario branches when scenario-shas.json verifies and made the deploy log open read only its tail, with property test 10.
+- 2026-11-14 | fix-deploy/8 | Kiro added the end-to-end test: error-spike, a fix pushed to a temp origin, deploy-fix, payments error ratio back below 0.01, reset to main.
+- 2026-11-14 | fix-deploy/9 | Kiro wrote scripts/fix-deploy-check.mjs and ran it only against a local bare origin (passed); it was not run against GitHub.
+- 2026-11-14 | fix-deploy/10 | Kiro updated DEV.md, .env.example and the steering, ran the full check chain and G1 in branch mode, and scanned for secrets and home paths.
+- 2026-11-14 | fix-deploy/11 | Kiro applied the code and security review fixes (EPERM-aware stop with a hard deadline, CAP_KILL probe, isolation_unavailable in production, size caps, gc, busy queue, prune protection, node_modules and executable refusals, git hardening, origin check and canary mode in fix-deploy-check) with a regression test for each.

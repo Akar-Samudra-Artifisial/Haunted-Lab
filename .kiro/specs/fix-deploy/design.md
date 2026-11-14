@@ -70,12 +70,14 @@ Lab-side codes inside those statuses (body `{ "error": { "code", "message" } }`)
 | 409 | `no_allowed_base` | a root commit was reached before an allowed head |
 | 409 | `empty_fix` | `sha` is itself an allowed head |
 | 422 | `outside_service` | a chain commit touches a path outside `services/<service>/` |
-| 422 | `manifest_change` | a chain commit touches a Manifest File |
-| 422 | `binary_or_special_change` | binary, symlink, submodule or mode change |
-| 422 | `diff_too_large` | more than 400 changed lines from the allowed head to `sha` |
+| 422 | `manifest_change` | a chain commit touches a Manifest File or any path with a `node_modules` segment |
+| 422 | `binary_or_special_change` | binary, symlink, submodule or mode change, or a new file with mode `100755` |
+| 422 | `diff_too_large` | more than 400 changed lines from the allowed head to `sha`; a new blob over 64 KiB; more than 256 KiB of new blobs in total; more than 200 changed files (the size caps reuse this reason) |
 | 503 | `origin_unreachable` | network error, DNS error or git timeout while talking to the origin |
 | 503 | `lab_not_pinned` | `scripts/scenario-shas.json` exists but does not verify against the mirror |
-| 503 | `deploy_failed` | accepted, but the worktree or spawn failed; the previous child keeps running |
+| 503 | `deploy_failed` | accepted, but the worktree or spawn failed, or the previous child did not stop (`stop_timeout`); the previous child keeps running |
+| 503 | `isolation_unavailable` | `NODE_ENV=production` and `FIX_RUN_AS_USER` is not set: fix deploys are off, nothing is fetched or deployed |
+| 503 | `busy` | one fetch runs and four requests already wait for the fetch lock |
 
 The Contract's 503 reads "origin unreachable"; the lab also uses 503 for the two "lab cannot do it now" cases so that the status set stays exactly the Contract's. Haunted Ops treats every 503 as retryable-then-fail, which fits both. Oversize bodies, normally 413 on this server, become 400 on this route only. 405 for other methods is the server's usual answer and is outside the Contract.
 
@@ -112,8 +114,9 @@ Merge fix: the merge commit's first parent is D, so the chain is `[merge]`, comp
 - Path `LAB_DATA_DIR/repo.git` (default `data/repo.git`). `data/` is created with mode `0700`.
 - Create if missing: `git clone --bare --no-hardlinks -- <source> <mirror>`.
 - Every start: `git remote set-url origin <LAB_ORIGIN_URL>`; `git config --replace-all remote.origin.fetch +refs/heads/incident/*:refs/heads/incident/*`; `git fetch --no-tags <source> +refs/heads/main:refs/heads/main +refs/heads/scenario/*:refs/heads/scenario/*` (local file protocol allowed for this one call); delete any local ref outside `main`, `scenario/*` and `incident/*`.
-- Fetch of a fix: as in the flow above, under a fetch lock, `GIT_ALLOW_PROTOCOL=https` (`https:file` only with `LAB_ALLOW_FILE_ORIGIN=1`), plus the existing isolated git env (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, no `HOME`) and the 30 s timeout. No credentials are ever configured; the origin is public.
-- Incident ref limit: after each fetch, keep the 50 newest `incident/*` refs by fetch time (recorded in `data/incident-refs.json`), `git update-ref -d` the rest locally, never on the origin.
+- Fetch of a fix: as in the flow above, under a fetch lock, `GIT_ALLOW_PROTOCOL=https` (`https:file` only with `LAB_ALLOW_FILE_ORIGIN=1`), plus the existing isolated git env (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GIT_NO_REPLACE_OBJECTS=1`, no `HOME`), `-c fetch.fsckObjects=true -c transfer.fsckObjects=true -c core.hooksPath=/dev/null` on every git call, and the 30 s timeout. No credentials are ever configured; the origin is public. The fetch lock lets one fetch run and four wait; a further request is 503 `busy`.
+- Incident ref limit: after each fetch, keep the 50 newest `incident/*` refs by fetch time (recorded in `data/incident-refs.json`), plus every deployed ref and every ref fetched in the last 10 minutes (a request may be between its fetch and its deploy; pruning its ref would give it a false 404), `git update-ref -d` the rest locally, never on the origin. When refs were removed, `git gc --prune=now --quiet` (60 s timeout) drops their objects so disk use stays bounded.
+- Size: besides 400 changed lines, every new blob is at most 64 KiB, the new blobs from the reached head to `sha` total at most 256 KiB, and at most 200 files change per commit and in total (blob sizes from `git cat-file -s`); all refused as `diff_too_large`.
 - Allowed heads: if `scripts/scenario-shas.json` exists in the source, `verifyPlantRecord(mirror, record)` must return no problem, and the allowed heads are the three recorded SHAs plus the mirror's `main`. Without the record (snapshot repos in tests and G1), they are the four branch heads as found, and the supervisor logs "allowed heads not pinned (no scenario-shas.json)" once.
 
 `LAB_ORIGIN_URL` validation (`parseOriginUrl`): `new URL()`; protocol `https:`; no `username`, `password`, `search` or `hash`; host name not an IPv4 or IPv6 literal; path ends in `.git` or not, any. With `LAB_ALLOW_FILE_ORIGIN=1`, an absolute `file:///...` URL is also accepted. Anything else is a `ConfigError` naming `LAB_ORIGIN_URL`.
@@ -149,20 +152,26 @@ argv (`fixChildArgs(worktree, source)`):
 node --permission
      --allow-fs-read=<worktree>
      --allow-fs-read=<source>/node_modules
+     --allow-fs-read=<source>/services/<service>/node_modules
      --allow-fs-read=<source>/packages/lab-common
      --allow-net
+     --disable-warning=ExperimentalWarning
      src/main.ts --lab-service=<service>
 ```
 
-`<source>/packages/lab-common` is needed because the service's `node_modules/@haunted-lab/common` is a workspace symlink that resolves into the checkout. That package cannot be changed by a fix (the chain rule allows only `services/<service>/`). `--allow-net` is required: the service listens and calls its downstream, and Node's network permission is all or nothing. No write, child process, worker, addon, WASI, FFI or inspector permission is granted, so the child cannot spawn `ps`, read `/proc`, or read `data/` or the supervisor's source. A risk check (task 4.1) confirms on Node 26.7 that type stripping, the symlinked `node_modules` and `prom-client` work under these flags.
+`<source>/services/<service>/node_modules` is needed because module resolution `realpath`s through the worktree's `node_modules` link into that directory (task 4.1 found the three-path set fails there), and `<source>/packages/lab-common` because `@haunted-lab/common` is a workspace symlink that resolves into the checkout. Paths are passed as real paths (macOS temp dirs are symlinks). These three are paths of the source checkout, not of the fix's tree; a fix only changes its own worktree, and the chain rule refuses manifests and any path with a `node_modules` segment. `--allow-net` is required: the service listens and calls its downstream. Node's network permission is all or nothing: **`--allow-net` does not limit destinations, so the network is not a boundary under the permission model.** On EC2 the network boundary is the separate uid plus an owner-match firewall rule that allows only loopback for that uid and blocks IMDS; that is set up in Haunted Ops `deploy-demo`. On the Mac, fix code can reach any host the developer's machine can. No write, child process, worker, addon, WASI, FFI or inspector permission is granted, so the child cannot spawn `ps`, read `/proc`, or read `data/` or the supervisor's source. A risk check (task 4.1) confirms on Node 26.7 that type stripping, the symlinked `node_modules` and `prom-client` work under these flags.
 
-Node's documentation states the permission model is a seat belt against mistakes, not a security boundary against malicious code. It is the only layer on the Mac. On EC2 the OS user is the real boundary.
+Node's documentation states the permission model is a seat belt against mistakes, not a security boundary against malicious code. It is the only layer on the Mac. On EC2 the OS user (with its firewall rule) is the real boundary.
+
+Canary (`CANARY=1 node scripts/fix-deploy-check.mjs`, shared code in `scripts/canary.mjs`): a fix on `main` in a temp local origin adds `services/payments/src/canary.ts`, imported first by `main.ts`, which at boot tries `process.binding`, reading `/proc/<ppid>/environ` (Linux only, skipped on macOS), `child_process`, `new Worker`, reading the supervisor `.env`, and `process.kill(process.ppid, 0)`, and logs one `CANARY {...}` line. Every attempt must be denied. Allowed in development only: `process.kill(process.ppid, 0)` succeeds on the Mac because the child runs as the supervisor's own user and the permission model does not cover signals (a fix could also signal the supervisor there); it is printed as a WARN. With `FIX_RUN_AS_USER` it is EPERM and anything else fails the check.
 
 `FIX_RUN_AS_USER` (optional):
 
 - Validated name `^[a-z_][a-z0-9_-]{0,31}$`; uid and gid from `execFile('id', ['-u', name])` and `['-g', name]`; uid 0 and the supervisor's own uid are refused.
-- Fix children are spawned with `{ uid, gid }`. That needs the supervisor to hold `CAP_SETUID` and `CAP_SETGID` (systemd `AmbientCapabilities=` in `deploy-demo`); it does not need to run as root.
-- Startup probe: spawn `node -e 0` as the user; failure -> `ConfigError` naming `FIX_RUN_AS_USER`, exit 1.
+- Fix children are spawned with `{ uid, gid }`. That needs the supervisor to hold `CAP_SETUID` and `CAP_SETGID`, and `CAP_KILL` to signal those children (systemd `AmbientCapabilities=` in `deploy-demo`); it does not need to run as root.
+- Startup probe: spawn an idle `node` as the user, SIGTERM it and confirm it exits within 5 s. A spawn failure is `ConfigError` naming `FIX_RUN_AS_USER` and `CAP_SETUID`/`CAP_SETGID`; an EPERM or no exit names `CAP_KILL`; exit 1.
+- Stopping: `killGroup` reports EPERM instead of swallowing it; `stop()` logs it once, still sends SIGKILL after 5 s, and gives up 5 s after SIGKILL with `StopTimeoutError` (`stop_timeout`). The Lab turns that into a failed apply/reset (500 `stop_timeout`) or a 503 `deploy_failed` on deploy-fix, and releases its mutex, so later calls run. `stopAll` uses `allSettled`, so one stuck child never keeps the others running.
+- `NODE_ENV=production` without `FIX_RUN_AS_USER`: the supervisor starts (scenarios work) but logs `fix deploys disabled ...` and every deploy-fix is 503 `isolation_unavailable`. In development (any other `NODE_ENV`) the one log line below and the current behaviour stay.
 - Files: the fix user needs read access to `worktrees/` and the checkout's `node_modules` and `packages/lab-common` (a shared group, mode `0750`, set by `deploy-demo`), and no access to `data/` (`0700`).
 - Not set: one log line at start, `fix code runs as the supervisor's user (FIX_RUN_AS_USER not set; development only)`.
 
@@ -175,6 +184,8 @@ What each platform gets:
 | OS user | the supervisor's own user | separate `FIX_RUN_AS_USER`, no sudo |
 | Supervisor env readable by fix code | not through Node (no fs read outside the allow-list, no child process); the OS would allow the same user to read it | no: different uid; `/proc/<pid>/environ` needs ptrace read access, which the kernel refuses across uids; plus `hidepid=2` / systemd `ProtectProc=invisible` |
 | Instance credentials | none on the Mac | no instance role for that user; IMDS (`169.254.169.254`) blocked for its uid by an owner-match firewall rule |
+| Network | any destination (`--allow-net` does not limit hosts) | loopback only for that uid (owner-match firewall), IMDS blocked |
+| Signals to the supervisor | possible (same user) | EPERM (different uid) |
 | `data/` (mirror, deploy log, pids) | readable by the same user outside Node | `0700`, unreadable |
 
 Tokens and `/proc/<ppid>/environ`: the supervisor reads its tokens from env at start; the initial environ block of a process stays in `/proc/<pid>/environ` for its life, so deleting them from `process.env` would not help. The protection is the uid boundary above. The fix child's own `/proc/self/environ` contains only the whitelist.
@@ -217,8 +228,8 @@ Deploy log open (leftover): read the last 256 KiB; drop the first partial line; 
 ## Correctness Properties
 
 ### Property 1: The deploy rule accepts exactly a clean chain from the head to an allowed head
-For any head, requested sha, first-parent chain, allowed heads and service, `deployFixAllowed` accepts iff `sha` equals the head, `sha` is not an allowed head, an allowed head is reached within 20 commits without hitting a root, every chain commit compared with its first parent touches only `services/<service>/` (both paths of a rename), no change is binary, a symlink, a submodule or a mode change, no Manifest File is touched, and the total diff is at most 400 lines. Otherwise it returns exactly the first failing rule in the fixed order, with status 409 for head and chain rules and 422 for content rules.
-**Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.6, 4.1, 4.2, 4.3, 4.4, 4.5**
+For any head, requested sha, first-parent chain, allowed heads and service, `deployFixAllowed` accepts iff `sha` equals the head, `sha` is not an allowed head, an allowed head is reached within 20 commits without hitting a root, every chain commit compared with its first parent touches only `services/<service>/` (both paths of a rename), no change is binary, a symlink, a submodule or a mode change, no Manifest File is touched, no path has a `node_modules` segment, no new file is executable, no new blob exceeds 64 KiB, the new blobs total at most 256 KiB, and the total diff is at most 400 lines. Otherwise it returns exactly the first failing rule in the fixed order, with status 409 for head and chain rules and 422 for content rules.
+**Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.6, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7**
 
 ### Property 2: Body validation is total and exact
 For any JSON value or byte string, `validateDeployFixBody` returns a request iff it is an object with exactly `service`, `ref` and `sha`, `service` is one of the four, `ref` matches `^incident/c[a-z0-9]{24}$` and `sha` matches `^[0-9a-f]{40}$`; otherwise `bad_request`. It never throws, and no ref with `..`, a leading `-`, whitespace, `:` or a control character is ever accepted.
@@ -237,7 +248,7 @@ For any ports, bind host, service and supervisor env (including tokens), `fixChi
 **Validates: Requirements 9.1**
 
 ### Property 6: A fix child's permission flags are exactly the allowed set
-For any worktree and source path, `fixChildArgs` contains `--permission`, exactly three `--allow-fs-read` entries (the worktree, `<source>/node_modules`, `<source>/packages/lab-common`) and `--allow-net`, and contains no other `--allow-*` flag.
+For any worktree and source path, `fixChildArgs` contains `--permission`, exactly four `--allow-fs-read` entries (the worktree, `<source>/node_modules`, `<source>/services/<service>/node_modules`, `<source>/packages/lab-common`) and `--allow-net`, and contains no other `--allow-*` flag.
 **Validates: Requirements 9.2, 9.3**
 
 ### Property 7: Fix worktree cleanup removes exactly the stale ones
@@ -249,8 +260,8 @@ For any commit graph, allowed heads, local incident refs and requested string, t
 **Validates: Requirements 8.1**
 
 ### Property 9: The incident ref limit keeps the newest 50
-For any list of fetch times, the pruning plan keeps exactly the 50 newest incident refs (ties broken by name) and deletes only incident refs.
-**Validates: Requirements 6.6**
+For any list of fetch times, the pruning plan keeps exactly the 50 newest incident refs (ties broken by name), plus protected refs and refs fetched within the last 10 minutes, and deletes only incident refs.
+**Validates: Requirements 6.6, 6.8**
 
 ### Property 10: Opening the deploy log from its tail matches a full read
 For any deploy log content (valid records, malformed lines, a partial last line) and chunk size, opening from the tail gives the same next id and the same newest records (up to the tail size) as parsing the whole file, while reading at most the chunks needed to find one valid record plus the tail.

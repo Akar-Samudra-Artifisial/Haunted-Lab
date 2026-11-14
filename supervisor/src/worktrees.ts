@@ -1,6 +1,7 @@
-import { lstat, mkdir, readdir, rm, symlink } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { lstat, mkdir, readdir, rm, symlink, utimes } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
-import { headOf, worktreeAdd, worktreePrune, worktreeRemove } from './git.ts';
+import { git, headOf, worktreeAdd, worktreePrune, worktreeRemove } from './git.ts';
 import type { ServiceName } from './types.ts';
 
 export interface WorktreeOptions {
@@ -79,4 +80,83 @@ export async function ensureWorktree(opts: WorktreeOptions, service: ServiceName
   const link = join(serviceDir, 'node_modules');
   if (!(await exists(link))) await symlink(join(resolve(opts.depsDir), 'services', service, 'node_modules'), link, 'dir');
   return serviceDir;
+}
+
+export const FIX_WORKTREE_MAX_IDLE_MS = 60 * 60 * 1000;
+
+export interface WorktreeEntry {
+  /** `<service>@<sha>` */
+  name: string;
+  mtimeMs: number;
+}
+
+/**
+ * Which worktrees to remove. A worktree is a fix worktree iff its sha is not an allowed head.
+ * Inactive named (main / scenario) worktrees go; inactive fix worktrees go once idle for more than
+ * `maxIdleMs` (their mtime is touched when they stop being active). Active ones always stay.
+ */
+export function planWorktreeCleanup(opts: {
+  entries: readonly WorktreeEntry[];
+  active: ReadonlySet<string>;
+  allowedHeads: readonly string[];
+  now: number;
+  maxIdleMs?: number;
+}): string[] {
+  const maxIdle = opts.maxIdleMs ?? FIX_WORKTREE_MAX_IDLE_MS;
+  const out: string[] = [];
+  for (const e of opts.entries) {
+    if (!WORKTREE_NAME.test(e.name) || opts.active.has(e.name)) continue;
+    const sha = e.name.slice(e.name.indexOf('@') + 1);
+    const fix = !opts.allowedHeads.includes(sha);
+    if (!fix || opts.now - e.mtimeMs > maxIdle) out.push(e.name);
+  }
+  return out;
+}
+
+export async function listWorktrees(root: string): Promise<WorktreeEntry[]> {
+  const names = await readdir(resolve(root)).catch(() => [] as string[]);
+  const out: WorktreeEntry[] = [];
+  for (const name of names) {
+    if (!WORKTREE_NAME.test(name)) continue;
+    const st = await lstat(join(resolve(root), name)).catch(() => undefined);
+    if (st?.isDirectory()) out.push({ name, mtimeMs: st.mtimeMs });
+  }
+  return out;
+}
+
+/** Mark a fix worktree as "last used now" (it just stopped being active). */
+export async function touchWorktree(root: string, dir: string): Promise<void> {
+  assertInside(root, dir);
+  const now = new Date();
+  await utimes(dir, now, now);
+}
+
+const real = (p: string) => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+};
+
+/**
+ * Migration: lab worktrees under `root` that are still registered to the source checkout (older
+ * versions registered them there) are removed through the source, then the source is pruned, so
+ * `git worktree list` in the checkout shows only the checkout.
+ */
+export async function removeSourceWorktrees(source: string, root: string): Promise<string[]> {
+  const listed = await git(source, ['worktree', 'list', '--porcelain']);
+  const rootReal = real(root);
+  const removed: string[] = [];
+  for (const line of listed.stdout.split('\n')) {
+    if (!line.startsWith('worktree ')) continue;
+    const path = line.slice('worktree '.length);
+    const rel = relative(rootReal, real(path));
+    if (rel.startsWith('..') || rel.includes(sep) || !WORKTREE_NAME.test(rel)) continue;
+    const r = await git(source, ['worktree', 'remove', '--force', '--force', path]);
+    if (r.code !== 0) await rm(join(resolve(root), rel), { recursive: true, force: true });
+    removed.push(rel);
+  }
+  await worktreePrune(source);
+  return removed;
 }

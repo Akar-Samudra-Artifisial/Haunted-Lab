@@ -52,6 +52,8 @@ Out of scope: the EC2 user, instance role and IMDS firewall rules (Haunted Ops `
 4. THE Supervisor SHALL accept as `LAB_ORIGIN_URL` only an `https:` URL with a host name, no user name, password, query or fragment, and a host that is not an IP address; an invalid value SHALL stop the Supervisor at start with the variable name only.
 5. WHERE `LAB_ALLOW_FILE_ORIGIN=1` is set (tests only), THE Supervisor SHALL also accept an absolute `file://` URL as `LAB_ORIGIN_URL` and SHALL then allow the `file` protocol for fetches from it.
 6. THE Supervisor SHALL run at most one fetch at a time; a second Deploy_Fix_Route request SHALL wait for the first fetch to finish.
+7. IF four requests are already waiting for the fetch lock, THEN THE Deploy_Fix_Route SHALL answer a further request 503 with the code `busy`.
+8. THE Supervisor SHALL run every git call on the Mirror and its Worktrees with `-c fetch.fsckObjects=true -c transfer.fsckObjects=true -c core.hooksPath=/dev/null` and `GIT_NO_REPLACE_OBJECTS=1`, in addition to `GIT_CONFIG_GLOBAL=/dev/null`.
 
 ### Requirement 3: Head and chain rule
 
@@ -77,6 +79,8 @@ Out of scope: the EC2 user, instance role and IMDS firewall rules (Haunted Ops `
 3. IF any Chain commit touches a Manifest_File, THEN THE Deploy_Fix_Route SHALL answer 422 with the code `manifest_change`.
 4. IF the total diff from the reached Allowed_Head to the Fix_Sha has more than 400 changed lines (added plus deleted), THEN THE Deploy_Fix_Route SHALL answer 422 with the code `diff_too_large`.
 5. THE content rules SHALL be checked after the head and chain rule and only when the chain reached an Allowed_Head.
+6. IF any changed blob in the Chain is larger than 64 KiB, or the new blobs from the reached Allowed_Head to the Fix_Sha total more than 256 KiB, or a commit or the total diff changes more than 200 files, THEN THE Deploy_Fix_Route SHALL answer 422 with the code `diff_too_large`.
+7. IF any Chain commit touches a path with a `node_modules` segment, THEN THE Deploy_Fix_Route SHALL answer 422 with the code `manifest_change`; IF it adds a file with mode `100755`, THEN it SHALL answer 422 with the code `binary_or_special_change`.
 
 ### Requirement 5: Deploying the fix
 
@@ -104,6 +108,7 @@ Out of scope: the EC2 user, instance role and IMDS firewall rules (Haunted Ops `
 5. WHEN the Supervisor starts and after every Deploy, THE Supervisor SHALL remove every Fix_Worktree that is not deployed and was last used more than 1 h ago, through `git worktree remove --force` and `git worktree prune`; scenario and `main` Worktrees SHALL keep their existing rule (only the active one per Service).
 6. THE Supervisor SHALL keep at most the 50 most recently fetched Incident_Refs in the Mirror and SHALL delete older ones locally only, never on the Origin.
 7. THE Mirror SHALL live under `data/`, which is git-ignored.
+8. THE incident ref prune SHALL never remove a ref fetched in the last 10 minutes or a deployed ref, so that a request between its fetch and its deploy never gets a false 404, and WHEN it removed refs THE Supervisor SHALL run `git gc --prune=now --quiet` on the Mirror with a timeout.
 
 ### Requirement 7: Allow-list
 
@@ -132,12 +137,15 @@ Out of scope: the EC2 user, instance role and IMDS firewall rules (Haunted Ops `
 #### Acceptance Criteria
 
 1. THE Supervisor SHALL give a Fix_Child an env built only from a whitelist: its own port variable, `SERVICE_BIND_HOST`, its downstream URL variable (derived from the ports), `NODE_ENV=production` and a fixed `PATH=/usr/bin:/bin`, and SHALL NOT pass `CHAOS_TOKEN`, `LAB_READ_TOKEN` or any other Supervisor variable.
-2. THE Supervisor SHALL start a Fix_Child with `node --permission`, with `--allow-fs-read` only for its Fix_Worktree, the Source_Checkout's `node_modules` and the Source_Checkout's `packages/lab-common`, and with `--allow-net`.
+2. THE Supervisor SHALL start a Fix_Child with `node --permission`, with `--allow-fs-read` only for its Fix_Worktree, the Source_Checkout's `node_modules`, the Source_Checkout's `services/<service>/node_modules` and the Source_Checkout's `packages/lab-common`, and with `--allow-net`.
 3. THE Supervisor SHALL NOT pass `--allow-fs-write`, `--allow-child-process`, `--allow-worker`, `--allow-addons`, `--allow-wasi`, `--allow-ffi` or `--allow-inspector` to a Fix_Child.
 4. WHERE `FIX_RUN_AS_USER` is set, THE Supervisor SHALL accept only a name matching `^[a-z_][a-z0-9_-]{0,31}$`, SHALL resolve its uid and gid through `execFile('id', ...)` at start, SHALL refuse uid 0 and its own uid, and SHALL spawn every Fix_Child with that uid and gid.
 5. WHERE `FIX_RUN_AS_USER` is set, WHEN the Supervisor starts, it SHALL spawn a probe child as the Fix_User and SHALL exit with code 1, naming only `FIX_RUN_AS_USER`, if the probe cannot start.
 6. WHERE `FIX_RUN_AS_USER` is not set, THE Supervisor SHALL log once at start that fix code runs as the Supervisor's own user and that this is for development only.
 7. THE Supervisor SHALL start `main` and `scenario/*` children as before.
+8. WHEN the Supervisor stops a child, it SHALL log an EPERM from `kill` once and continue to SIGKILL, and IF the child has not exited 5 s after SIGKILL, THEN `stop` SHALL fail with `stop_timeout` and release the Lab mutex, so that later apply, reset and deploy-fix calls still run.
+9. WHERE `FIX_RUN_AS_USER` is set, the startup probe SHALL also start an idle child as the Fix_User, SIGTERM it and confirm that it exits, and SHALL refuse to start with a message naming `CAP_KILL` if it does not.
+10. WHEN `NODE_ENV=production` and `FIX_RUN_AS_USER` is not set, THE Deploy_Fix_Route SHALL answer 503 with the code `isolation_unavailable` and SHALL deploy nothing; in development the behaviour of 9.6 stays.
 
 ### Requirement 10: Protection of supervisor secrets
 
@@ -148,6 +156,7 @@ Out of scope: the EC2 user, instance role and IMDS firewall rules (Haunted Ops `
 1. WHERE `FIX_RUN_AS_USER` is set on Linux, THE Fix_User SHALL NOT be able to read `/proc/<supervisor pid>/environ`, because the Supervisor runs as a different uid and the kernel's ptrace access check refuses it; the design SHALL document this and the additional `hidepid` / `ProtectProc` setting done in `deploy-demo`.
 2. THE Supervisor SHALL create `data/` (Deploy_Log, `pids.json`, Mirror) with mode `0700`, so that the Fix_User cannot read it.
 3. THE design SHALL state what the Mac gets (Node permission model only, same OS user) and what EC2 gets (separate OS user, no instance role, IMDS blocked for that user), and that the EC2 part is done in Haunted Ops `deploy-demo`.
+4. THE design and the security steering SHALL state that `--allow-net` does not limit destinations, so that on EC2 the network boundary is the Fix_User's uid plus an owner-match firewall allowing only loopback for it, with IMDS blocked, set up in Haunted Ops `deploy-demo`.
 
 ### Requirement 11: Review leftovers
 
@@ -170,3 +179,5 @@ Out of scope: the EC2 user, instance role and IMDS firewall rules (Haunted Ops `
 3. THE `scripts/fix-deploy-check.mjs` SHALL, given `REF` and `SHA`, start a Supervisor with a temporary data directory against the real GitHub Origin, apply the scenario whose head the chain reaches, call the Deploy_Fix_Route, assert that the scenario's signal returns to healthy through the Service's `/metrics` or `/healthz`, reset, print a table and exit 0 or 1.
 4. THE `scripts/fix-deploy-check.mjs` SHALL never push, SHALL generate throwaway tokens it never prints, and SHALL stop everything it started.
 5. THE `docs/DEV.md` SHALL describe the Mirror, `LAB_ORIGIN_URL`, `FIX_RUN_AS_USER`, the Deploy_Fix_Route and the check script, with env names only.
+6. WHEN `CANARY=1`, THE `scripts/fix-deploy-check.mjs` SHALL deploy from a temp local origin a fix whose payments code tries at boot `process.binding`, reading `/proc/<ppid>/environ` (Linux only), `child_process`, `new Worker`, reading the supervisor `.env` and `process.kill(process.ppid, 0)`, and SHALL pass only if every attempt is denied, except signalling the parent in development, which it SHALL print as a WARN.
+7. THE `scripts/fix-deploy-check.mjs` SHALL validate `LAB_ORIGIN_URL` with the Supervisor's validator before any fetch and SHALL exit 2 naming only the variable when it is invalid.

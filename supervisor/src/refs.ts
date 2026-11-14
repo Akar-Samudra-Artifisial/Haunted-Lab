@@ -1,14 +1,18 @@
-/** The only refs the supervisor may deploy. */
+import { INCIDENT_REF } from './fix-contract.ts';
+
+/** Refs deployable by name (boot, apply, reset). */
 export const ALLOW_LIST: readonly string[] = Object.freeze(['main', 'scenario/error-spike', 'scenario/fog', 'scenario/dark-room']);
 
-export type RefClass = 'allowed' | 'reserved' | 'denied';
+/**
+ * `named`: `main` and the three scenario branches.
+ * `fix`: `incident/<cuid>`, deployable only through `POST /chaos/deploy-fix`.
+ * `denied`: everything else, including `exorcist/*`.
+ */
+export type RefClass = 'named' | 'fix' | 'denied';
 
-const RESERVED = /^exorcist\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
-
-/** `exorcist/*` fix branches are recognised but refused until a later spec enables them. */
 export function classifyRef(ref: unknown): RefClass {
   if (typeof ref !== 'string') return 'denied';
-  if (ALLOW_LIST.includes(ref)) return 'allowed';
-  if (RESERVED.test(ref) && !ref.includes('..')) return 'reserved';
+  if (ALLOW_LIST.includes(ref)) return 'named';
+  if (INCIDENT_REF.test(ref)) return 'fix';
   return 'denied';
 }

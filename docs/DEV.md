@@ -31,6 +31,9 @@ Copy `.env.example` to `.env` and fill in values. Never commit `.env`.
 | `LAB_REPO_DIR` | repo the deploy refs come from | this checkout |
 | `LAB_DATA_DIR`, `LAB_WORKTREES_DIR` | deploy log, worktrees | `data/`, `worktrees/` |
 | `LAB_ECHO_CHILD_OUTPUT` | `0` to stop echoing service output | `1` |
+| `LAB_ORIGIN_URL` | public https origin the `incident/*` fix refs are fetched from | the GitHub repo |
+| `FIX_RUN_AS_USER` | optional OS user for fix children (EC2) | unset |
+| `LAB_ALLOW_FILE_ORIGIN` | `1` allows a `file://` origin (tests only) | `0` |
 | `PROMETHEUS_PORT`, `LAB_HOST_ADDR` | `deploy/compose.yaml` | `9090`, `host-gateway` |
 
 Tokens: at least 16 characters each, different from each other, and not the `change-me...` placeholders from `.env.example` (for example `openssl rand -hex 24`). Otherwise the supervisor exits at start with the variable names only.
@@ -87,7 +90,50 @@ node scripts/g1-check.mjs
 
 Needs ports 4001-4004, 4100 and 9090 free on `127.0.0.1`. On Linux it adds `deploy/compose.linux.yaml`. It generates throwaway tokens, starts the supervisor (5 rps) and Prometheus (compose project `haunted-lab-g1`), waits for four targets and a healthy baseline, then for each scenario applies it, asserts the PromQL signal within 30 s (`error-spike`: payments 5xx ratio > 0.2; `fog`: orders p95 > 1 s; `dark-room`: `up{service="ledger"} == 0`), resets and asserts recovery within 30 s. It prints a table, stops everything it started and exits 0 or 1.
 
-If this checkout's scenario branches are planted on a `main` that holds the services, G1 uses them. Otherwise it builds the snapshot lab repo in a temp dir and says so.
+If `scripts/scenario-shas.json` verifies against this checkout (each scenario branch one commit on the recorded base, the base an ancestor of `main`, the SHAs equal) and `main` holds the services, G1 uses the real scenario branches and prints `lab repo: this checkout (...)`. Otherwise it builds the snapshot lab repo in a temp dir and prints why.
+
+## Fix deploys (`POST /chaos/deploy-fix`)
+
+Haunted Ops opens fix pull requests `exorcist/<huntId>` -> `incident/<huntId>` against this repo; after a human merges one, it calls:
+
+```sh
+curl -s -H "Authorization: Bearer $CHAOS_TOKEN" -H 'content-type: application/json' \
+  -d '{"service":"payments","ref":"incident/<cuid>","sha":"<40 hex>"}' http://127.0.0.1:4100/chaos/deploy-fix
+```
+
+Statuses (the Haunted Ops contract): 200 `{ deployId, service, sha }`; 400 bad body (also over 8 KiB); 401 bad token; 404 `unknown_ref`; 409 `not_head`, `chain_too_long`, `no_allowed_base`, `empty_fix`; 422 `outside_service`, `manifest_change` (also any `node_modules` path), `binary_or_special_change` (also a new executable file), `diff_too_large` (over 400 lines, a blob over 64 KiB, over 256 KiB in total, or over 200 files); 503 `origin_unreachable`, `lab_not_pinned`, `deploy_failed`, `isolation_unavailable`, `busy` (four requests already waiting).
+
+- **Mirror.** The supervisor deploys and diffs from the bare mirror `data/repo.git` (git-ignored, `data/` is `0700`). At every start it copies `main` and `scenario/*` from this checkout into it; from `LAB_ORIGIN_URL` it fetches only the one requested `incident/*` ref (`https` only, no credentials, `--end-of-options`, 30 s timeout). It keeps the 50 newest incident refs locally. Nothing is fetched into this checkout, and its `git worktree list` stays clean: worktrees under `worktrees/` belong to the mirror.
+- **Rule.** `sha` must be the head of the fetched ref; its first-parent chain (at most 20 commits) must reach `main` or a scenario head pinned by `scripts/scenario-shas.json`; every commit (a merge counts against its first parent) may touch only `services/<service>/`, no binary, symlink, submodule, mode or manifest change, and at most 400 changed lines in total.
+- **Worktrees.** Named worktrees: only the active one per service. A fix worktree stays for an hour after it stops being active (reuse, inspection), then the cleanup at start and after every deploy removes it.
+- **Isolation.** Fix children get a whitelist env only (own port, bind host, downstream URL, `NODE_ENV=production`, `PATH=/usr/bin:/bin`) and run under `node --permission` with fs read limited to their worktree, the checkout's `node_modules`, `services/<service>/node_modules` and `packages/lab-common`, plus `--allow-net`; no fs write, child process, worker, addon, WASI, FFI or inspector.
+
+| | Mac (development) | EC2 (demo; set up by Haunted Ops `deploy-demo`) |
+| --- | --- | --- |
+| Env | whitelist only | whitelist only |
+| Node permission model | yes | yes |
+| OS user | the supervisor's own user (logged once at start) | `FIX_RUN_AS_USER`, a separate user without sudo |
+| Supervisor tokens readable by fix code | not through Node (no fs read outside the allow-list, no child process); the OS would allow the same user | no: `/proc/<pid>/environ` needs ptrace read access, which the kernel refuses across uids; plus `hidepid=2` / systemd `ProtectProc=invisible` |
+| Instance credentials | none on a Mac | no instance role for that user; IMDS blocked for its uid by a firewall owner match |
+| `data/` (mirror, deploy log, pids) | readable by the same user outside Node | `0700`, not readable |
+
+Node itself calls its permission model a seat belt, not a security boundary against malicious code; on EC2 the separate OS user is the boundary. `FIX_RUN_AS_USER` needs the supervisor to hold `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` (systemd `AmbientCapabilities`): the first two to start fix children as that user, `CAP_KILL` to stop them. A startup probe starts an idle child as the user, SIGTERMs it and refuses to run (naming the missing capability) if either step fails. With `NODE_ENV=production` and no `FIX_RUN_AS_USER`, the supervisor still runs scenarios but every `deploy-fix` answers 503 `isolation_unavailable`.
+
+`--allow-net` does not limit destinations, so the permission model is not a network boundary: on EC2 an owner-match firewall rule (Haunted Ops `deploy-demo`) allows only loopback for the fix user and blocks IMDS; on a Mac fix code can reach any host and can signal the supervisor (same user).
+
+### Fix-deploy check
+
+```sh
+REF=incident/<cuid> SHA=<40 hex> node scripts/fix-deploy-check.mjs
+```
+
+Used by the Haunted Ops G-MVP gate. It fetches only `REF` from the origin into a temp bare repo, finds the pinned scenario the fix sits on, starts a supervisor on this checkout with a temp data dir and throwaway tokens (never printed), applies the scenario and checks it is broken, calls `deploy-fix`, checks the signal is healthy again (payments 5xx ratio, orders p95 from the histogram, ledger `/healthz`), checks the Deploy Record (`actor: "exorcist"`), resets, prints a table and exits 0 or 1. It needs ports 4001-4004 and 4100 free, never pushes, and stops everything it started. `LAB_ORIGIN_URL` overrides the origin (with `LAB_ALLOW_FILE_ORIGIN=1` for a local `file://` test origin); it is checked with the supervisor's own validator before anything is fetched.
+
+```sh
+CANARY=1 node scripts/fix-deploy-check.mjs
+```
+
+Isolation canary, local only (never GitHub): a fix on `main` from a temp origin adds payments code that at boot tries `process.binding`, reading `/proc/<ppid>/environ` (Linux), `child_process`, `new Worker`, reading this checkout's `.env`, and `process.kill(process.ppid, 0)`. The check passes only if each is denied; signalling the parent is allowed in development (same OS user) and printed as a WARN.
 
 ## Mac and EC2 notes
 

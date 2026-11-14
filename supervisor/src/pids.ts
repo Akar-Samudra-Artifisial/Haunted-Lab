@@ -28,6 +28,14 @@ export class PidFile {
     return this.#flush();
   }
 
+  /** Resolves once every queued write has finished. */
+  idle(): Promise<void> {
+    return this.#queue.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+
   /** Atomic write (tmp + rename), serialized. */
   #flush(): Promise<void> {
     const snapshot = JSON.stringify(this.#pids);
@@ -75,22 +83,35 @@ const alive = (pid: number): boolean => {
   }
 };
 
-/** Signal a whole process group, falling back to the pid itself. */
-export function killGroup(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(-pid, signal);
-  } catch {
+export type KillFn = (pid: number, signal: NodeJS.Signals | 0) => void;
+
+/** `sent`: delivered; `gone`: no such process; `eperm`: not allowed (e.g. a child running as another uid without CAP_KILL). */
+export type KillResult = 'sent' | 'gone' | 'eperm';
+
+const errCode = (err: unknown) => (err as NodeJS.ErrnoException | undefined)?.code;
+
+/**
+ * Signal a whole process group, falling back to the pid itself. EPERM is reported, never
+ * swallowed: the caller logs it and keeps escalating.
+ */
+export function killGroup(pid: number, signal: NodeJS.Signals, kill: KillFn = process.kill.bind(process)): KillResult {
+  let eperm = false;
+  for (const target of [-pid, pid]) {
     try {
-      process.kill(pid, signal);
-    } catch {
-      // already gone
+      kill(target, signal);
+      return 'sent';
+    } catch (err) {
+      if (errCode(err) === 'EPERM') eperm = true;
     }
   }
+  return eperm ? 'eperm' : 'gone';
 }
 
 export interface KillStaleOptions {
   commandOf?: (pid: number) => Promise<string | undefined>;
   graceMs?: number;
+  kill?: KillFn;
+  log?: (line: string) => void;
 }
 
 /**
@@ -106,10 +127,11 @@ export async function killStale(file: string, opts: KillStaleOptions = {}): Prom
   for (const [service, pid] of Object.entries(pids) as [ServiceName, number][]) {
     const cmd = await lookup(pid);
     if (!cmd || !cmd.includes('src/main.ts') || !cmd.split(/\s+/).includes(labMarker(service))) continue;
-    killGroup(pid, 'SIGTERM');
+    const kill = opts.kill ?? process.kill.bind(process);
+    if (killGroup(pid, 'SIGTERM', kill) === 'eperm') opts.log?.(`not allowed to signal stale ${service} child (EPERM); trying SIGKILL`);
     const end = Date.now() + (opts.graceMs ?? 5000);
     while (alive(pid) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
-    if (alive(pid)) killGroup(pid, 'SIGKILL');
+    if (alive(pid) && killGroup(pid, 'SIGKILL', kill) === 'eperm') opts.log?.(`not allowed to SIGKILL stale ${service} child (EPERM); it may still hold its port`);
     killed.push(service);
   }
   await writeFile(file, '{}\n', 'utf8').catch(() => undefined);

@@ -4,8 +4,8 @@
 // Everything it starts is stopped on exit. Tokens are generated per run and never printed.
 //
 // Usage: node scripts/g1-check.mjs
-//   Uses this checkout's scenario branches when they are planted on a main that holds the
-//   services; otherwise builds a deterministic snapshot lab repo in a temp dir (see DEV.md).
+//   Uses this checkout's real scenario branches when scripts/scenario-shas.json verifies against
+//   them; otherwise builds a deterministic snapshot lab repo in a temp dir and prints why.
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -13,7 +13,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildSnapshotRepo, git, plantScenarios, SCENARIO_PATCHES } from './lab-git.mjs';
+import { buildSnapshotRepo, git, labRepoChoice, plantScenarios } from './lab-git.mjs';
 
 const CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const COMPOSE_FILE = join(CHECKOUT, 'deploy', 'compose.yaml');
@@ -83,21 +83,14 @@ async function poll(query, pred, seconds) {
   return { ok: false, value: last, secs: (Date.now() - t0) / 1000 };
 }
 
-/** Use this checkout if its scenario branches are planted on a main that has the services. */
+/** Use this checkout's real scenario branches when scenario-shas.json verifies; else a snapshot repo. */
 async function chooseRepo(tmp) {
-  try {
-    const main = await git(CHECKOUT, ['rev-parse', '--verify', 'refs/heads/main^{commit}']);
-    await git(CHECKOUT, ['cat-file', '-e', `${main}:services/gate/src/main.ts`]);
-    for (const s of SCENARIO_PATCHES) {
-      if ((await git(CHECKOUT, ['rev-parse', `refs/heads/${s.branch}^`])) !== main) throw new Error('not planted on main');
-    }
-    return { repo: CHECKOUT, kind: 'this checkout' };
-  } catch {
-    const repo = join(tmp, 'repo');
-    await buildSnapshotRepo(CHECKOUT, repo);
-    await plantScenarios(repo);
-    return { repo, kind: 'snapshot (services not yet on main here)' };
-  }
+  const choice = await labRepoChoice(CHECKOUT);
+  if (choice.mode === 'branches') return { repo: CHECKOUT, kind: `this checkout (${choice.reason})` };
+  const repo = join(tmp, 'repo');
+  await buildSnapshotRepo(CHECKOUT, repo);
+  await plantScenarios(repo);
+  return { repo, kind: `snapshot (${choice.reason})` };
 }
 
 const fmt = (v) => (Number.isNaN(v) ? 'n/a' : Number.isInteger(v) ? String(v) : v.toFixed(3));

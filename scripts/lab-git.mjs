@@ -26,7 +26,7 @@ export function git(repo, args, opts = {}) {
     const child = execFile(
       'git',
       ['-C', repo, ...args],
-      { env: { ...BASE_ENV, ...opts.env }, maxBuffer: 16 * 1024 * 1024 },
+      { env: { ...BASE_ENV, ...opts.env }, maxBuffer: 16 * 1024 * 1024, timeout: 120_000, killSignal: 'SIGKILL' },
       (err, stdout, stderr) => {
         if (err) reject(new Error(`git ${args[0]} failed: ${String(stderr).trim().split('\n')[0] ?? ''}`));
         else resolve(opts.raw ? String(stdout) : String(stdout).trim());
@@ -236,4 +236,30 @@ export async function buildSnapshotRepo(srcRoot, dest) {
     await git(dest, ['update-ref', 'refs/heads/main', sha]);
     return sha;
   });
+}
+
+/**
+ * Which lab repo the gates use. `branches` when `scripts/scenario-shas.json` exists in `checkout`,
+ * verifies against it (`verifyPlantRecord`: committing the record may move `main`) and `main`
+ * holds the services; otherwise `snapshot`, with the reason.
+ * @param {string} checkout
+ * @returns {Promise<{ mode: 'branches' | 'snapshot', reason: string }>}
+ */
+export async function labRepoChoice(checkout) {
+  const recordFile = join(checkout, 'scripts', 'scenario-shas.json');
+  if (!existsSync(recordFile)) return { mode: 'snapshot', reason: 'no scripts/scenario-shas.json' };
+  let record;
+  try {
+    record = JSON.parse(await readFile(recordFile, 'utf8'));
+  } catch {
+    return { mode: 'snapshot', reason: 'scripts/scenario-shas.json is unreadable' };
+  }
+  const problems = await verifyPlantRecord(checkout, record).catch((err) => [String(err instanceof Error ? err.message : err)]);
+  if (problems.length > 0) return { mode: 'snapshot', reason: problems[0] };
+  const services = await git(checkout, ['cat-file', '-e', 'refs/heads/main:services/gate/src/main.ts']).then(
+    () => true,
+    () => false,
+  );
+  if (!services) return { mode: 'snapshot', reason: 'main does not hold the services' };
+  return { mode: 'branches', reason: 'scenario branches match scripts/scenario-shas.json' };
 }

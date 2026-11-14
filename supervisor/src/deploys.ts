@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { Ring } from '@haunted-lab/common';
 import { isServiceName, type DeployRecord } from './types.ts';
@@ -48,9 +48,58 @@ export async function readDeployFile(file: string): Promise<DeployRecord[]> {
   return out;
 }
 
+/** Chunk size for reading the deploy log from its end. */
+export const TAIL_CHUNK_BYTES = 256 * 1024;
+
+/**
+ * Read the newest records from the end of a deploy log, chunk by chunk, without reading the whole
+ * file: stop once `tailSize` valid records were found, or once at least one was found and
+ * `maxBytes` were read, or at the file start. A line cut by a chunk boundary is completed by the
+ * next (earlier) chunk. Returns the records oldest first and the bytes read.
+ */
+export async function readDeployTail(
+  file: string,
+  tailSize: number,
+  chunkBytes: number = TAIL_CHUNK_BYTES,
+  maxBytes: number = TAIL_CHUNK_BYTES,
+): Promise<{ records: DeployRecord[]; bytesRead: number }> {
+  let fh;
+  try {
+    fh = await open(file, 'r');
+  } catch {
+    return { records: [], bytesRead: 0 };
+  }
+  try {
+    const size = (await fh.stat()).size;
+    let start = size;
+    let buf = Buffer.alloc(0);
+    let records: DeployRecord[] = [];
+    while (start > 0) {
+      const from = Math.max(0, start - chunkBytes);
+      const chunk = Buffer.alloc(start - from);
+      await fh.read(chunk, 0, chunk.length, from);
+      buf = Buffer.concat([chunk, buf]);
+      start = from;
+      const lines = buf.toString('utf8').split('\n');
+      if (start > 0) lines.shift(); // may be partial: completed by the next chunk
+      records = [];
+      for (const line of lines) {
+        if (line.trim() === '') continue;
+        const r = parseRecord(line);
+        if (r) records.push(r);
+      }
+      const read = size - start;
+      if (records.length >= tailSize || (records.length >= 1 && read >= maxBytes)) break;
+    }
+    return { records: records.slice(Math.max(0, records.length - tailSize)), bytesRead: size - start };
+  } finally {
+    await fh.close();
+  }
+}
+
 /**
  * Append-only JSON Lines deploy log (`data/deploys.jsonl`). Never rewritten or truncated.
- * The file is read once at open; afterwards a bounded in-memory tail serves reads.
+ * Only the end of the file is read at open; afterwards a bounded in-memory tail serves reads.
  */
 export class DeployLog {
   readonly file: string;
@@ -66,10 +115,11 @@ export class DeployLog {
   static async open(file: string, tailSize: number = DEPLOY_TAIL): Promise<DeployLog> {
     const log = new DeployLog(file, tailSize);
     await mkdir(dirname(file), { recursive: true });
-    const all = await readDeployFile(file);
-    const max = all.reduce((m, r) => Math.max(m, idNumber(r.id)), FIRST_DEPLOY_ID - 1);
+    // Only the end of the file is read: ids only grow, so the newest valid record has the highest id.
+    const { records } = await readDeployTail(file, tailSize);
+    const max = records.reduce((m, r) => Math.max(m, idNumber(r.id)), FIRST_DEPLOY_ID - 1);
     log.#next = max + 1;
-    for (const r of all) log.#tail.push(r);
+    for (const r of records) log.#tail.push(r);
     return log;
   }
 

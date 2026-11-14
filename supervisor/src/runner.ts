@@ -1,13 +1,15 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { join } from 'node:path';
 import { Ring } from '@haunted-lab/common';
-import { killGroup, labMarker } from './pids.ts';
+import { killGroup, labMarker, type KillFn } from './pids.ts';
 import type { ErrorItem, LogItem, RunStatus, ServiceName, ServiceState } from './types.ts';
 
 export const BACKOFF_START_MS = 500;
 export const BACKOFF_CAP_MS = 30_000;
 export const STABLE_AFTER_MS = 60_000;
 export const STOP_GRACE_MS = 5_000;
+/** After SIGKILL, give up waiting for the child after this long (e.g. a child of another uid we may not signal). */
+export const STOP_HARD_MS = 5_000;
 export const OUTPUT_LINES = 500;
 export const EXIT_EVENTS = 200;
 const MAX_LINE = 2000;
@@ -59,6 +61,16 @@ export interface Deployment {
   sha: string;
   /** `<worktree>/services/<service>` */
   dir: string;
+  /** An `incident/*` fix: started through the isolated spawn plan. */
+  fix?: boolean;
+}
+
+/** How to start one child: node argv (after the node binary), env and optional uid/gid. */
+export interface SpawnPlan {
+  args: string[];
+  env: Record<string, string>;
+  uid?: number;
+  gid?: number;
 }
 
 export interface RunnerOptions {
@@ -74,6 +86,24 @@ export interface RunnerOptions {
   /** Called with the pid of each started / exited child (feeds `data/pids.json`). */
   onSpawn?: (pid: number) => void;
   onExit?: (pid: number) => void;
+  /** Spawn plan for fix deployments (whitelist env, `node --permission`, optional uid/gid). Without it a fix cannot start. */
+  fixPlan?: (d: Deployment) => SpawnPlan;
+  /** Injected for tests: process spawning and signalling. */
+  spawn?: typeof spawn;
+  kill?: KillFn;
+  stopGraceMs?: number;
+  stopHardMs?: number;
+  /** Supervisor log (EPERM and stop timeouts). */
+  log?: (line: string) => void;
+}
+
+/** `stop()` gave up: the child did not exit after SIGTERM, SIGKILL and the hard deadline. */
+export class StopTimeoutError extends Error {
+  readonly code = 'stop_timeout';
+  constructor(service: ServiceName) {
+    super(`${service} did not stop after SIGKILL`);
+    this.name = 'StopTimeoutError';
+  }
 }
 
 export interface Runner {
@@ -123,6 +153,7 @@ export class ServiceRunner implements Runner {
   }
 
   async deploy(d: Deployment): Promise<void> {
+    if (d.fix && !this.#opts.fixPlan) throw new Error('fix deployments need an isolated spawn plan');
     await this.stop();
     this.#deployment = d;
     this.#failures = 0;
@@ -153,12 +184,21 @@ export class ServiceRunner implements Runner {
     this.#lastStderr = '';
     // Own process group (detached) so the whole group can be signalled, and a marker argument so a
     // later supervisor can recognise a stale child from data/pids.json after a SIGKILL.
-    const child = spawn(process.execPath, [join('src', 'main.ts'), labMarker(this.service)], {
+    let plan: SpawnPlan;
+    if (d.fix) {
+      if (!this.#opts.fixPlan) throw new Error('fix deployments need an isolated spawn plan');
+      plan = this.#opts.fixPlan(d);
+    } else {
+      plan = { args: [join('src', 'main.ts'), labMarker(this.service)], env: this.#opts.env };
+    }
+    const child = (this.#opts.spawn ?? spawn)(process.execPath, plan.args, {
       cwd: d.dir,
-      env: this.#opts.env,
+      env: plan.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
       windowsHide: true,
+      ...(plan.uid !== undefined ? { uid: plan.uid } : {}),
+      ...(plan.gid !== undefined ? { gid: plan.gid } : {}),
     });
     this.#child = child;
     const pid = child.pid;
@@ -207,7 +247,11 @@ export class ServiceRunner implements Runner {
     });
   }
 
-  /** Stop the child: SIGTERM, then SIGKILL after 5 s. Cancels any pending restart. */
+  /**
+   * Stop the child: SIGTERM, then SIGKILL after 5 s, then give up after the hard deadline and
+   * reject with `StopTimeoutError` (so callers holding the Lab mutex release it instead of hanging).
+   * EPERM is logged once per stop and escalation continues. Cancels any pending restart.
+   */
   stop(): Promise<void> {
     this.#generation++;
     clearTimeout(this.#restartTimer);
@@ -217,12 +261,27 @@ export class ServiceRunner implements Runner {
     this.#status = 'stopped';
     this.#since = this.#now();
     if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const pid = child.pid;
-      const signal = (sig: NodeJS.Signals) => (pid === undefined ? child.kill(sig) : killGroup(pid, sig));
-      const kill = setTimeout(() => signal('SIGKILL'), STOP_GRACE_MS);
+      let warned = false;
+      const signal = (sig: NodeJS.Signals) => {
+        const r = pid === undefined ? (child.kill(sig) ? 'sent' : 'gone') : killGroup(pid, sig, this.#opts.kill);
+        if (r === 'eperm' && !warned) {
+          warned = true;
+          this.#opts.log?.(`not allowed to signal ${this.service} (pid ${pid}, EPERM); does the supervisor have CAP_KILL?`);
+        }
+      };
+      let hard: NodeJS.Timeout | undefined;
+      const kill = setTimeout(() => {
+        signal('SIGKILL');
+        hard = setTimeout(() => {
+          this.#opts.log?.(`${this.service} did not exit after SIGKILL; giving up (stop_timeout)`);
+          reject(new StopTimeoutError(this.service));
+        }, this.#opts.stopHardMs ?? STOP_HARD_MS);
+      }, this.#opts.stopGraceMs ?? STOP_GRACE_MS);
       child.once('close', () => {
         clearTimeout(kill);
+        clearTimeout(hard);
         resolve();
       });
       signal('SIGTERM');

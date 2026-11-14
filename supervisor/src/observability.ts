@@ -92,6 +92,8 @@ export interface ObservabilityDeps {
   /** In-memory tail of the deploy log (no file read per request). */
   deploys(): DeployRecord[];
   resolveRef(ref: string): Promise<string | undefined>;
+  /** Heads of the incident refs fetched into the mirror (fix commits are served too). */
+  incidentTips?(): Promise<string[]>;
 }
 
 const cleanError = (e: ErrorItem): ErrorItem => ({
@@ -140,16 +142,21 @@ export function listDeploys(deps: ObservabilityDeps, q: LabQuery) {
 
 export const unknownCommit = (): HttpError => new HttpError(404, 'unknown_commit', 'unknown commit');
 
-/** The commit's full sha if `hex` names a commit reachable from an allow-listed ref, else undefined. */
-export async function reachableCommit(deps: Pick<ObservabilityDeps, 'repo' | 'resolveRef'>, hex: string): Promise<string | undefined> {
+/** The commit's full sha if `hex` names a commit reachable from a named ref or a fetched incident ref, else undefined. */
+export async function reachableCommit(deps: Pick<ObservabilityDeps, 'repo' | 'resolveRef' | 'incidentTips'>, hex: string): Promise<string | undefined> {
   // Upper-case hex is accepted and normalised; anything else is not a commit name.
   const lower = hex.toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(lower)) return undefined;
   const sha = await resolveCommit(deps.repo, lower);
   if (!sha) return undefined;
+  const tips: string[] = [];
   for (const ref of ALLOW_LIST) {
     const tip = await deps.resolveRef(ref);
-    if (tip && (tip === sha || (await isAncestor(deps.repo, sha, tip)))) return sha;
+    if (tip) tips.push(tip);
+  }
+  if (deps.incidentTips) tips.push(...(await deps.incidentTips()));
+  for (const tip of new Set(tips)) {
+    if (tip === sha || (await isAncestor(deps.repo, sha, tip))) return sha;
   }
   return undefined;
 }
